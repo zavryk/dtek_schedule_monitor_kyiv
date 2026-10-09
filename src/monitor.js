@@ -17,11 +17,20 @@ const AJAX_RETRY_MS = 15_000
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function readCsrf(page) {
-  const tag = await page.waitForSelector('meta[name="csrf-token"]', {
-    state: "attached",
-    timeout: PAGE_WAIT_MS,
-  })
-  return tag.getAttribute("content")
+  try {
+    const tag = await page.waitForSelector('meta[name="csrf-token"]', {
+      state: "attached",
+      timeout: PAGE_WAIT_MS,
+    })
+    return await tag.getAttribute("content")
+  } catch (error) {
+    // що саме показує сайт замість сторінки (заглушка, капча, помилка)
+    const title = await page.title().catch(() => "?")
+    const text = await page
+      .evaluate(() => document.body?.innerText?.replace(/\s+/g, " ").slice(0, 200) ?? "")
+      .catch(() => "?")
+    throw Error(`no csrf-token at ${page.url()} (title "${title}", text "${text}")`)
+  }
 }
 
 // Одна сторінка на сайт: CSRF-токен беремо раз, далі лише AJAX-запити по вулицях.
