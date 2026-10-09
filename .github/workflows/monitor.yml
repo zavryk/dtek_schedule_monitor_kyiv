@@ -1,24 +1,22 @@
 name: Run power outages monitor
 
+# Запускає сервер (workflow_dispatch), він же потім забирає artifact "result"
+# і сам шле сповіщення в Telegram. Репозиторій нічого не комітить.
+# Адреси приходять з сервера зашифрованими (AES-256, openssl), ключ - секрет TARGETS_KEY.
 on:
-  #schedule:
-  #  - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Записати поточні відключення у стан без відправки в Telegram"
-        required: false
-        type: boolean
-        default: false
+      targets:
+        description: "Зашифрований JSON адрес (openssl enc -aes-256-cbc -pbkdf2 -a -A)"
+        required: true
+        type: string
 
-# Не запускати два моніторинги одночасно: обидва комітять artifacts/
 concurrency:
   group: monitor
   cancel-in-progress: false
 
-# Комітимо стан стандартним GITHUB_TOKEN, окремий PAT не потрібен
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   monitor:
@@ -28,8 +26,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -48,29 +44,23 @@ jobs:
           npm ci
           npx playwright install chromium
 
+      - name: Decrypt targets
+        env:
+          ENC: ${{ inputs.targets }}
+          TARGETS_KEY: ${{ secrets.TARGETS_KEY }}
+        run: |
+          printf '%s' "$ENC" | openssl enc -d -aes-256-cbc -pbkdf2 -a -A -pass env:TARGETS_KEY             > "$RUNNER_TEMP/targets.json"
+
       - name: Run monitoring script
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TARGETS: ${{ secrets.TARGETS }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          TARGETS_FILE: ${{ runner.temp }}/targets.json
         run: node ./src/monitor.js
 
-      - name: Commit updated artifacts
+      - name: Upload result
         if: always()
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          git add artifacts/
-
-          if ! git diff --cached --quiet; then
-            LAST_COMMIT_MSG=$(git log -1 --pretty=%B || echo "")
-            if [ "$LAST_COMMIT_MSG" = "chore: update artifacts" ]; then
-              git commit --amend --no-edit
-            else
-              git commit -m "chore: update artifacts"
-            fi
-            git push origin main --force-with-lease
-          else
-            echo "No changes to commit"
-          fi
+        uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: artifacts/result.json
+          retention-days: 1
+          if-no-files-found: error
