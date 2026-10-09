@@ -1,209 +1,191 @@
 import { chromium } from "playwright"
 
-import {
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID,
-  STREET,
-  HOUSE,
-  SHUTDOWNS_PAGE,
-} from "./constants.js"
+import { TELEGRAM_BOT_TOKEN, TARGETS, DRY_RUN, SITES } from "./constants.js"
 
 import {
   capitalize,
-  deleteLastMessage,
-  getCurrentTime,
-  loadLastMessage,
-  saveLastMessage,
+  isQuietHoursKyiv,
+  loadState,
+  loadTargets,
+  saveState,
+  targetKey,
 } from "./helpers.js"
 
-async function getInfo() {
-  console.log("🌀 Getting info...")
-
-  const browser = await chromium.launch({ headless: true })
-  const browserPage = await browser.newPage()
-
-  try {
-    await browserPage.goto(SHUTDOWNS_PAGE, {
-      waitUntil: "load",
-    })
-
-    const csrfTokenTag = await browserPage.waitForSelector(
-      'meta[name="csrf-token"]',
-      { state: "attached" }
-    )
-    const csrfToken = await csrfTokenTag.getAttribute("content")
-
-    const info = await browserPage.evaluate(
-      async ({ STREET, csrfToken }) => {
-        const formData = new URLSearchParams()
-        formData.append("method", "getHomeNum")
-        formData.append("data[1][name]", "street")
-        formData.append("data[1][value]", STREET)
-        formData.append("data[2][name]", "updateFact")
-        formData.append("data[2][value]", new Date().toLocaleString("uk-UA"))
-
-        const response = await fetch("/ua/ajax", {
-          method: "POST",
-          headers: {
-            "x-requested-with": "XMLHttpRequest",
-            "x-csrf-token": csrfToken,
-          },
-          body: formData,
-        })
-        return await response.json()
-      },
-      { STREET, csrfToken }
-    )
-
-    console.log("✅ Getting info finished.")
-    return info
-  } catch (error) {
-    throw Error(`❌ Getting info failed: ${error.message}`)
-  } finally {
-    await browser.close()
-  }
+// Одна сторінка на сайт: CSRF-токен беремо раз, далі лише AJAX-запити по вулицях.
+async function openSite(browser, site) {
+  const page = await browser.newPage()
+  await page.goto(SITES[site].page, { waitUntil: "load" })
+  const tag = await page.waitForSelector('meta[name="csrf-token"]', {
+    state: "attached",
+  })
+  return { page, csrfToken: await tag.getAttribute("content") }
 }
 
-function checkIsOutage(info) {
-  console.log("🌀 Checking power outage...")
+async function fetchStreet({ page, csrfToken }, city, street) {
+  return page.evaluate(
+    async ({ city, street, csrfToken }) => {
+      const formData = new URLSearchParams()
+      formData.append("method", "getHomeNum")
+      if (city) {
+        formData.append("data[0][name]", "city")
+        formData.append("data[0][value]", city)
+      }
+      formData.append("data[1][name]", "street")
+      formData.append("data[1][value]", street)
+      formData.append("data[2][name]", "updateFact")
+      formData.append("data[2][value]", new Date().toLocaleString("uk-UA"))
 
-  if (!info?.data) {
-    throw Error("❌ Power outage info missed.")
-  }
-
-  const { sub_type, start_date, end_date, type } = info?.data?.[HOUSE] || {}
-  const isOutageDetected =
-    sub_type !== "" || start_date !== "" || end_date !== "" || type !== ""
-
-  isOutageDetected
-    ? console.log("🚨 Power outage detected!")
-    : console.log("⚡️ No power outage!")
-
-  return isOutageDetected
+      const response = await fetch("/ua/ajax", {
+        method: "POST",
+        headers: {
+          "x-requested-with": "XMLHttpRequest",
+          "x-csrf-token": csrfToken,
+        },
+        body: formData,
+      })
+      return await response.json()
+    },
+    { city, street, csrfToken }
+  )
 }
 
-function checkIsScheduled(info) {
-  console.log("🌀 Checking whether power outage scheduled...")
+// Повертає дані лише для екстреного/аварійного відключення, інакше null.
+function getEmergency(info, house) {
+  if (!info?.data) throw Error("❌ Power outage info missed.")
 
-  if (!info?.data) {
-    throw Error("❌ Power outage info missed.")
-  }
+  const { sub_type = "", start_date = "", end_date = "", type = "" } =
+    info.data[house] || {}
+  if (!sub_type && !start_date && !end_date && !type) return null
 
-  const { sub_type } = info?.data?.[HOUSE] || {}
-  const isScheduled =
-    !sub_type.toLowerCase().includes("авар") &&
-    !sub_type.toLowerCase().includes("екст")
+  const subType = sub_type.toLowerCase()
+  if (!subType.includes("авар") && !subType.includes("екст")) return null
 
-  isScheduled
-    ? console.log("🗓️ Power outage scheduled!")
-    : console.log("⚠️ Power outage not scheduled!")
-
-  return isScheduled
+  return { sub_type, start_date, end_date }
 }
 
-function generateMessage(info) {
-  console.log("🌀 Generating message...")
-
-  const { sub_type, start_date, end_date } = info?.data?.[HOUSE] || {}
-  const { updateTimestamp } = info || {}
-
+function generateMessage(t, { sub_type, start_date, end_date }, updateTimestamp) {
   const reason = capitalize(sub_type).replace(/екстренні/gi, "Екстрені")
   const [beginTime, beginDate] = start_date.split(" ")
   const [endTime, endDate] = end_date.split(" ")
   const period = `${beginTime} ${beginDate} — ${endTime} ${endDate}`
+  const site = SITES[t.site]
+
   const text = [
     "🚨🚨 <b>Екстрене відключення:</b>",
+    ...(t.showStreet ? ["", `📍 <b><u>${t.street}</u></b>`] : []),
     `<blockquote><code>🌑 ${beginTime} ${beginDate}\n🌕 ${endTime} ${endDate}</code></blockquote>`,
     "",
     `⚠️ <b>Причина: </b><i>${reason}.</i>`,
     "",
     `‼️ <b>Терміни орієнтовні</b>`,
     `🔄 <b>Оновлено: </b> <i>${updateTimestamp}</i>`,
-    `🔗 <b>Джерело: </b><a href="https://www.dtek-kem.com.ua/ua/shutdowns">ДТЕК КЕМ</a>`
+    `🔗 <b>Джерело: </b><a href="${site.page}">${site.name}</a>`,
   ].join("\n")
-  
+
   return { text, period }
 }
 
-function isQuietHoursKyiv() {
-  const now = new Date()
+async function sendMessage(chat, text, disable_notification) {
+  const { id, thread } = typeof chat === "object" ? chat : { id: chat }
+  const payload = { chat_id: id, text, parse_mode: "HTML", disable_notification }
+  if (thread) payload.message_thread_id = Number(thread)
 
-  const hh = Number(now.toLocaleString("en-US", { timeZone: "Europe/Kyiv", hour: "2-digit", hour12: false }).trim())
-  const mm = Number(now.toLocaleString("en-US", { timeZone: "Europe/Kyiv", minute: "2-digit" }).trim())
-
-
-  const minutes = hh * 60 + mm
-  return minutes >= 0 && minutes < 390 // 00:00..06:29 (06:30 = 390 вже НЕ тихо)
-}
-
-
-async function sendNotification(text, period) {
-  if (!TELEGRAM_BOT_TOKEN) throw Error("❌ Missing telegram bot token.")
-  if (!TELEGRAM_CHAT_ID) throw Error("❌ Missing telegram chat id.")
-
-  const lastMessage = loadLastMessage() || {}
-
-  // ✅ якщо період не змінився — нічого не робимо
-  if (lastMessage.period === period) {
-    console.log("🟡 Period unchanged. Skip sending.")
-    return
-  }
-
-  console.log("🌀 Sending notification...")
-
-  const disable_notification = isQuietHoursKyiv()
-  
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CHAT_ID,
-          text,
-          parse_mode: "HTML",
-          disable_notification,
-        }),
-      }
-    )
-
-    const data = await response.json()
-    if (!response.ok || data.ok === false) {
-      throw Error(`Telegram API error: ${data.description || response.status}`)
+  const resp = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
     }
-    
-    saveLastMessage({
-      message_id: data.result.message_id,
-      date: data.result.date,
-      text,
-      period,
-    })
-
-  
-    console.log(
-      disable_notification ? "🟢 Notification sent (silent)." : "🟢 Notification sent."
-    )
-  } catch (error) {
-    console.log("🔴 Notification not sent.", error.message)
-    deleteLastMessage()
+  )
+  const data = await resp.json()
+  if (!resp.ok || data.ok === false) {
+    throw Error(`Telegram API error: ${data.description || resp.status}`)
   }
 }
 
+// Шле в ті чати, куди цей період ще не пішов; при збої одного чату решта не дублюються.
+async function notify(t, entry, text, period) {
+  if (entry.period !== period) {
+    entry.period = period
+    entry.sent = []
+  }
+  const disable_notification = isQuietHoursKyiv()
+  let failed = false
 
+  for (const chat of t.chats) {
+    const id = String(typeof chat === "object" ? chat.id : chat)
+    if (entry.sent.includes(id)) continue
+    if (DRY_RUN) {
+      entry.sent.push(id)
+      console.log(`🧪 Dry run: marked as sent to ${id}`)
+      continue
+    }
+    try {
+      await sendMessage(chat, text, disable_notification)
+      entry.sent.push(id)
+      entry.updated_at = new Date().toISOString()
+      console.log(`🟢 Sent${disable_notification ? " (silent)" : ""} to ${id}`)
+    } catch (error) {
+      failed = true
+      console.error(`🔴 Not sent to ${id}: ${error.message}`)
+    }
+  }
+  return !failed
+}
 
 async function run() {
-  const info = await getInfo()
-  const isOutage = checkIsOutage(info)
+  if (!TELEGRAM_BOT_TOKEN) throw Error("❌ Missing telegram bot token.")
+  const targets = loadTargets(TARGETS)
+  const state = loadState()
+  let ok = true
 
-  if (!isOutage) return
+  const browser = await chromium.launch({ headless: true })
+  try {
+    const sites = {}
+    const streets = {}
 
-  const isScheduled = checkIsScheduled(info)
-  if (isOutage && !isScheduled) {
-    const { text, period } = generateMessage(info)
-    await sendNotification(text, period)
+    for (const [i, t] of targets.entries()) {
+      const key = targetKey(t)
+      const label = `#${i + 1} ${t.site}`
+      try {
+        sites[t.site] ??= openSite(browser, t.site)
+        const site = await sites[t.site]
 
+        const streetKey = `${t.site}|${t.city || ""}|${t.street}`
+        streets[streetKey] ??= fetchStreet(site, t.city, t.street)
+        const info = await streets[streetKey]
+
+        const emergency = getEmergency(info, t.house)
+        if (!emergency) {
+          console.log(`⚡️ ${label}: no emergency outage`)
+          continue
+        }
+
+        const { text, period } = generateMessage(t, emergency, info.updateTimestamp)
+        const entry = (state[key] ??= {})
+        if (entry.period === period && entry.sent?.length === t.chats.length) {
+          console.log(`🟡 ${label}: period unchanged (${period})`)
+          continue
+        }
+
+        console.log(`🚨 ${label}: ${period}`)
+        if (!(await notify(t, entry, text, period))) ok = false
+      } catch (error) {
+        ok = false
+        delete sites[t.site]
+        console.error(`❌ ${label}: ${error.message}`)
+      }
+    }
+  } finally {
+    await browser.close()
+    saveState(state)
   }
+
+  if (!ok) process.exitCode = 1
 }
 
-run().catch((error) => console.error(error.message))
+run().catch((error) => {
+  console.error(error.message)
+  process.exitCode = 1
+})

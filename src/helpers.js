@@ -1,73 +1,56 @@
 import fs from "node:fs"
 import path from "node:path"
 
-import { LAST_MESSAGE_FILE } from "./constants.js"
+import { STATE_FILE, QUIET_UNTIL_MIN, SITES } from "./constants.js"
 
 export function capitalize(str) {
-  if (typeof str !== "string") return ""
+  if (typeof str !== "string" || !str) return ""
   return str[0].toUpperCase() + str.slice(1).toLowerCase()
 }
 
-export function loadLastMessage() {
-  if (!fs.existsSync(LAST_MESSAGE_FILE)) return null
-
-  const lastMessage = JSON.parse(
-    fs.readFileSync(LAST_MESSAGE_FILE, "utf8").trim()
-  )
-
-  if (lastMessage?.date) {
-    const messageDay = new Date(lastMessage.date * 1000).toLocaleDateString(
-      "en-CA",
-      { timeZone: "Europe/Kyiv" }
-    )
-    const today = new Date().toLocaleDateString("en-CA", {
-      timeZone: "Europe/Kyiv",
-    })
-
-    if (messageDay < today) {
-      deleteLastMessage()
-      return null
+export function loadTargets(json) {
+  if (!json) throw Error("❌ Missing TARGETS secret.")
+  let targets
+  try {
+    targets = JSON.parse(json)
+  } catch (error) {
+    throw Error(`❌ TARGETS is not valid JSON: ${error.message}`)
+  }
+  if (!Array.isArray(targets) || !targets.length) {
+    throw Error("❌ TARGETS must be a non-empty array.")
+  }
+  for (const t of targets) {
+    if (!SITES[t.site]) throw Error(`❌ Unknown site "${t.site}" (kem | krem).`)
+    if (!t.street || !t.house) throw Error("❌ Each target needs street and house.")
+    if (!Array.isArray(t.chats) || !t.chats.length) {
+      throw Error(`❌ No chats for ${t.street} ${t.house}.`)
     }
   }
-
-  return lastMessage
+  return targets
 }
 
-export function saveLastMessage({ date, message_id, text, period } = {}) {
-  fs.mkdirSync(path.dirname(LAST_MESSAGE_FILE), { recursive: true })
-  fs.writeFileSync(
-    LAST_MESSAGE_FILE,
-    JSON.stringify(
-      {
-        message_id,
-        date,
-        text,
-        period,
-      },
-      null,
-      2
-    ),
-    "utf8"
-  )
+export function targetKey(t) {
+  return [t.site, t.city || "", t.street, t.house].join("|")
 }
 
-
-export function deleteLastMessage() {
-  fs.rmdirSync(path.dirname(LAST_MESSAGE_FILE), { recursive: true })
+export function loadState() {
+  if (!fs.existsSync(STATE_FILE)) return {}
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8").trim() || "{}")
+  } catch {
+    return {}
+  }
 }
 
-export function getCurrentTime() {
-  const now = new Date()
+export function saveState(state) {
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true })
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n", "utf8")
+}
 
-  const date = now.toLocaleDateString("uk-UA", {
-    timeZone: "Europe/Kyiv",
-  })
-
-  const time = now.toLocaleTimeString("uk-UA", {
-    timeZone: "Europe/Kyiv",
-    hour: "2-digit",
-    minute: "2-digit",
-  })
-
-  return `${time} ${date}`
+export function isQuietHoursKyiv() {
+  const [hh, mm] = new Date()
+    .toLocaleTimeString("en-GB", { timeZone: "Europe/Kyiv", hour12: false })
+    .split(":")
+    .map(Number)
+  return hh * 60 + mm < QUIET_UNTIL_MIN
 }

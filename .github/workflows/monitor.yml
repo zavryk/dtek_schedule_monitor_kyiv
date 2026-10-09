@@ -4,38 +4,59 @@ on:
   #schedule:
   #  - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Записати поточні відключення у стан без відправки в Telegram"
+        required: false
+        type: boolean
+        default: false
+
+# Не запускати два моніторинги одночасно: обидва комітять artifacts/
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+# Комітимо стан стандартним GITHUB_TOKEN, окремий PAT не потрібен
+permissions:
+  contents: write
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version-file: ".nvmrc"
+          cache: npm
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         run: |
-          npm install
+          npm ci
           npx playwright install chromium
 
       - name: Run monitoring script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CITY: ${{ secrets.CITY }}
-          STREET: ${{ secrets.STREET }}
-          HOUSE: ${{ secrets.HOUSE }}
+          TARGETS: ${{ secrets.TARGETS }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: node ./src/monitor.js
 
       - name: Commit updated artifacts
+        if: always()
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
