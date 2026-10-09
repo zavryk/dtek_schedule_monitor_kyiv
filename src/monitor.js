@@ -9,17 +9,49 @@ import { chromium } from "playwright"
 import { TARGETS, SITES, RESULT_FILE } from "./constants.js"
 import { loadTargets } from "./helpers.js"
 
+// Під навантаженням сайт віддає заглушку, яка сама знімається - чекаємо до ~1.5 хв.
+const PAGE_WAIT_MS = 90_000
+const AJAX_ATTEMPTS = 6
+const AJAX_RETRY_MS = 15_000
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function readCsrf(page) {
+  const tag = await page.waitForSelector('meta[name="csrf-token"]', {
+    state: "attached",
+    timeout: PAGE_WAIT_MS,
+  })
+  return tag.getAttribute("content")
+}
+
 // Одна сторінка на сайт: CSRF-токен беремо раз, далі лише AJAX-запити по вулицях.
 async function openSite(browser, site) {
   const page = await browser.newPage()
-  await page.goto(SITES[site].page, { waitUntil: "load" })
-  const tag = await page.waitForSelector('meta[name="csrf-token"]', {
-    state: "attached",
-  })
-  return { page, csrfToken: await tag.getAttribute("content") }
+  await page.goto(SITES[site].page, { waitUntil: "load", timeout: PAGE_WAIT_MS })
+  return { page, csrfToken: await readCsrf(page) }
 }
 
-async function fetchStreet({ page, csrfToken }, city, street) {
+async function fetchStreet(site, city, street) {
+  for (let attempt = 1; ; attempt++) {
+    const { status, body } = await postStreet(site, city, street)
+    try {
+      const info = JSON.parse(body)
+      if (info?.data) return info
+      throw Error("no data in response")
+    } catch (error) {
+      if (attempt >= AJAX_ATTEMPTS) {
+        throw Error(`ajax failed after ${attempt} attempts: HTTP ${status}, ${error.message}`)
+      }
+      console.log(`⏳ ajax HTTP ${status} (${error.message}), retry ${attempt}/${AJAX_ATTEMPTS - 1}`)
+      await sleep(AJAX_RETRY_MS)
+      // заглушка могла замінити сторінку або протухнув токен - перечитуємо
+      await site.page.reload({ waitUntil: "load", timeout: PAGE_WAIT_MS })
+      site.csrfToken = await readCsrf(site.page)
+    }
+  }
+}
+
+async function postStreet({ page, csrfToken }, city, street) {
   return page.evaluate(
     async ({ city, street, csrfToken }) => {
       const formData = new URLSearchParams()
@@ -41,7 +73,7 @@ async function fetchStreet({ page, csrfToken }, city, street) {
         },
         body: formData,
       })
-      return await response.json()
+      return { status: response.status, body: await response.text() }
     },
     { city, street, csrfToken }
   )
@@ -50,9 +82,15 @@ async function fetchStreet({ page, csrfToken }, city, street) {
 // Екстрене/аварійне відключення або null; планові не цікавлять.
 function getEmergency(info, house) {
   if (!info?.data) throw Error("Power outage info missed")
+  if (!(house in info.data)) {
+    // без цього помилка в адресі виглядала б як "відключень немає"
+    const prefix = String(house).match(/^\d+/)?.[0] ?? ""
+    const similar = Object.keys(info.data).filter((h) => prefix && h.startsWith(prefix))
+    throw Error(`house "${house}" not found; similar: ${similar.join(", ") || "none"}`)
+  }
 
   const { sub_type = "", start_date = "", end_date = "", type = "" } =
-    info.data[house] || {}
+    info.data[house]
   if (!sub_type && !start_date && !end_date && !type) return null
 
   const subType = sub_type.toLowerCase()
