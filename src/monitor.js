@@ -37,7 +37,13 @@ async function readCsrf(page) {
 async function openSite(browser, site) {
   const page = await browser.newPage()
   await page.goto(SITES[site].page, { waitUntil: "load", timeout: PAGE_WAIT_MS })
-  return { page, csrfToken: await readCsrf(page) }
+  try {
+    return { page, csrfToken: await readCsrf(page) }
+  } catch (error) {
+    console.log(`⏳ ${site}: ${error.message}; reloading`)
+    await page.reload({ waitUntil: "load", timeout: PAGE_WAIT_MS })
+    return { page, csrfToken: await readCsrf(page) }
+  }
 }
 
 async function fetchStreet(site, city, street) {
@@ -137,8 +143,7 @@ async function run() {
         }
         console.log(emergency ? `🚨 ${t.id}: ${emergency.start_date} — ${emergency.end_date}` : `⚡️ ${t.id}: no emergency`)
       } catch (error) {
-        ok = false
-        delete sites[t.site]
+        ok = false  // сайт, що не відкрився, у цьому запуску не повторюємо - решту адрес на ньому теж пропускаємо
         result.targets[t.id] = { ok: false, site: t.site, error: error.message }
         console.error(`❌ ${t.id}: ${error.message}`)
       }
